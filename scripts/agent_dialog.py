@@ -215,6 +215,38 @@ def scan_codex():
     return records
 
 
+def scan_history():
+    """扫描 Claude Code 输入历史（~/.claude/history.jsonl，2025-11 至今）。
+
+    每行记录用户的一次输入：display(内容)、project、sessionId、timestamp。
+    早期（2025-11 ~ 2026-05）完整对话已被清理，此文件是唯一残留。
+    """
+    records = []
+    fp = HOME / ".claude" / "history.jsonl"
+    if not fp.is_file():
+        return records
+    with open(fp, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            display = (d.get("display") or "").strip()
+            if not display:
+                continue
+            records.append({
+                "id": d.get("sessionId") or "",
+                "agent": "history",
+                "cwd": d.get("project") or "",
+                "project": d.get("project") or "",
+                "title": display[:120],
+                "time": _fmt_ts_ms(d.get("timestamp", 0)),
+                "archived": False,
+                "_file": str(fp),
+            })
+    return records
+
+
 def first_user_text_codex(fp):
     try:
         with open(fp, encoding="utf-8", errors="replace") as fh:
@@ -260,6 +292,16 @@ def _fmt_ts(ts):
         except Exception:
             continue
     return ""
+
+
+def _fmt_ts_ms(ms):
+    """毫秒时间戳 -> YYYY-MM-DD HH:MM，失败返回 ''"""
+    if not ms:
+        return ""
+    try:
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
 
 
 def scan_all(agent=None):
@@ -579,6 +621,11 @@ def main():
     p = sub.add_parser("resume-cmd", help="输出恢复命令")
     p.add_argument("id")
 
+    p = sub.add_parser("hist", help="搜索早期输入历史（history.jsonl，2025-11至今）")
+    p.add_argument("pattern")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("running", help="查看正在运行的对话（进程 + 最近活跃会话）")
     p.add_argument("--minutes", type=int, default=30, help="活跃判定窗口（分钟，默认30）")
     p.add_argument("--json", action="store_true")
@@ -592,8 +639,34 @@ def main():
         print("Claude Code 对话: ", CLAUDE_DIR)
         print("Codex 对话:       ", CODEX_DIR)
         print("Codex 归档:       ", CODEX_ARCHIVE_DIR)
+        print("早期输入历史:     ", HOME / ".claude" / "history.jsonl")
         print("备注存储:         ", NOTES_FILE)
         print(f"当前共索引 {len(records)} 个对话")
+        return
+
+    if args.cmd == "hist":
+        hist = scan_history()
+        try:
+            rx = re.compile(args.pattern, re.IGNORECASE)
+        except re.error as e:
+            print(f"无效的正则表达式: {e}", file=sys.stderr)
+            sys.exit(2)
+        hits = [r for r in hist if rx.search(r["title"])]
+        hits.sort(key=lambda r: r["time"], reverse=True)
+        if args.json:
+            print_json([
+                {"time": r["time"], "project": r["project"], "session": r["id"],
+                 "text": r["title"]} for r in hits[: args.limit]
+            ])
+        else:
+            print(f"在 history.jsonl 中匹配 {len(hits)} 条输入记录（关键词: {args.pattern}）")
+            print("（history.jsonl 覆盖 2025-11 至今；早期无完整对话，仅剩这些输入痕迹）\n")
+            for r in hits[: args.limit]:
+                sess = f" session={r['id'][:8]}" if r["id"] else ""
+                print(f"[{r['time']}] {r['project']}{sess}")
+                print(f"    {r['title'][:90]}")
+            if len(hits) > args.limit:
+                print(f"\n… 还有 {len(hits) - args.limit} 条，用 --limit 增加（当前 {args.limit}）")
         return
 
     if args.cmd == "running":

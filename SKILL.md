@@ -22,6 +22,7 @@ user-invocable: true
 | Claude Code | `~/.claude/projects/<项目>/*.jsonl` | 会话 ID = 文件名 |
 | Codex | `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl` | 含 Desktop/CLI 会话 |
 | Codex 归档 | `~/.codex/archived_sessions/` | 已归档会话，list 中标记 `[归档]` |
+| 早期输入历史 | `~/.claude/history.jsonl` | **2025-11 至今**的全部输入记录（早期完整对话已清理，仅剩此处痕迹） |
 | 备注/收藏 | `~/.claude/skills/agent-dialog_management/state/notes.json` | skill 自身维护 |
 
 每个会话记录：ID、来源（C=Claude / X=Codex）、真实工作目录、时间、标题（自动取
@@ -49,6 +50,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 收藏/取消 | `python <脚本> star <短ID>` |
 | 列出有备注的 | `python <脚本> notes` |
 | 查看正在运行的对话 | `python <脚本> running [--minutes 30]` |
+| 搜索早期输入历史 | `python <脚本> hist <关键词> [--limit 30]` |
 | 查看数据源 | `python <脚本> paths` |
 
 **ID 支持前缀匹配**：`show 79b26d95` 或完整 UUID 均可。
@@ -80,6 +82,16 @@ python <脚本> resume-cmd <短ID>
 
 > 注意：resume 是交互式命令，**不能在当前 Claude Code 会话内直接运行**（会占用/冲突），
 > 必须经 `cmd start` 开独立窗口，或提示用户手动运行输出的命令。
+
+### 3.5 搜索早期输入历史（history）
+2025-11 ~ 2026-05 的完整对话已被清理，但 `history.jsonl` 保留了你当时**每一次输入**（命令/提问/粘贴）。
+用户说"我早期做过 XX"时：
+```bash
+python <脚本> hist downscaler      # 找回 207 条提到 Downscaler 的历史输入
+python <脚本> hist 惠州             # 找回惠州项目相关输入（含 2025-12 的记录）
+```
+每条结果带：时间 / 项目 / sessionId / 输入内容。若 sessionId 恰好对应 6 月后的完整对话，
+可再用 `show`/`resume` 深入。
 
 ### 4. 备注 / 收藏
 给重要对话加备注便于日后找回：
