@@ -31,7 +31,9 @@ import glob
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -464,6 +466,66 @@ def export_markdown(rec, out_path):
     return out_path
 
 
+def count_processes():
+    """统计正在运行的 claude.exe / codex.exe / codex-code-mode-host.exe 进程数"""
+    ps = (
+        'Get-CimInstance Win32_Process | '
+        "Where-Object { $_.Name -match 'claude\\.exe|codex' } | "
+        "Group-Object Name | Select-Object Name, Count | Format-Table -HideTableHeaders"
+    )
+    counts = {}
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[-1].isdigit():
+                counts[parts[0]] = int(parts[-1])
+    except Exception:
+        pass
+    return counts
+
+
+def live_records(records, minutes):
+    """最近 minutes 分钟内有写入、且未归档的会话 = 正在活跃运行的对话。
+
+    注意：Codex 后台 app-server 服务可能定期 touch 旧会话文件，导致 mtime
+    误报；调用方应结合 codex 交互进程数判断。
+    """
+    cutoff = time.time() - minutes * 60
+    live = []
+    for rec in records:
+        if rec.get("archived"):
+            continue
+        fp = Path(rec.get("_file", ""))
+        try:
+            if fp.is_file() and fp.stat().st_mtime > cutoff:
+                live.append(rec)
+        except Exception:
+            continue
+    return live
+
+
+def codex_interactive_count():
+    """统计正在运行的 Codex 交互会话进程（排除 app-server 后台服务）"""
+    ps = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.Name -eq 'codex.exe' } | "
+        "Where-Object { $_.CommandLine -notmatch 'app-server' } | "
+        "Measure-Object | Select-Object -ExpandProperty Count"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        return int(out) if out.isdigit() else 0
+    except Exception:
+        return 0
+
+
 def resume_command(rec):
     """输出 Git Bash 兼容命令：先 cd 到会话原目录，再开新 cmd 窗口恢复。
 
@@ -517,6 +579,10 @@ def main():
     p = sub.add_parser("resume-cmd", help="输出恢复命令")
     p.add_argument("id")
 
+    p = sub.add_parser("running", help="查看正在运行的对话（进程 + 最近活跃会话）")
+    p.add_argument("--minutes", type=int, default=30, help="活跃判定窗口（分钟，默认30）")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("paths", help="显示数据源路径")
 
     args = ap.parse_args()
@@ -528,6 +594,43 @@ def main():
         print("Codex 归档:       ", CODEX_ARCHIVE_DIR)
         print("备注存储:         ", NOTES_FILE)
         print(f"当前共索引 {len(records)} 个对话")
+        return
+
+    if args.cmd == "running":
+        counts = count_processes()
+        live = live_records(records, args.minutes)
+        n_claude = counts.get("claude.exe", 0)
+        n_codex = counts.get("codex.exe", 0)
+        n_host = counts.get("codex-code-mode-host.exe", 0)
+        n_codex_inter = codex_interactive_count()
+        codex_apps_only = n_codex > 0 and n_codex_inter == 0
+        if args.json:
+            print_json({
+                "processes": counts,
+                "codex_interactive_sessions": n_codex_inter,
+                "live_sessions": [
+                    {"id": r["id"], "agent": r["agent"], "title": r["title"],
+                     "time": r["time"], "project": r["project"]} for r in live
+                ],
+                "window_minutes": args.minutes,
+            })
+            return
+        print(f"=== 正在运行的智能体对话 ===")
+        print(f"Claude Code: {n_claude} 个 claude.exe 会话窗口")
+        if n_codex_inter:
+            print(f"Codex: {n_codex_inter} 个交互会话进程 (+ {n_codex} codex.exe / {n_host} host)")
+        elif codex_apps_only:
+            print(f"Codex: 无交互对话（{n_codex} 个 codex.exe 均为 app-server 后台服务）")
+        else:
+            print("Codex: 无进程")
+        print(f"\n最近 {args.minutes} 分钟内有活动写入的会话（Claude 可靠，Codex 可能受后台服务影响）:")
+        for rec in live:
+            mark = ""
+            if codex_apps_only and rec["agent"] == "codex":
+                mark = "  ← 后台服务 touch，非用户对话"
+            print(fmt_line(rec) + mark)
+        if not live:
+            print("（无）")
         return
 
     if args.cmd == "list":

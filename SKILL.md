@@ -3,8 +3,9 @@ name: agent-dialog_management
 description: >
   管理电脑上所有智能体（Claude Code + Codex）的对话记录：统一列出、全文搜索找回
   遗忘/关闭的对话、查看内容、导出 Markdown、备注收藏、一键恢复（新开终端窗口
-  继续之前的会话）。当用户说"我的对话""找到之前那个对话""恢复某次对话""看看
-  智能体聊了什么""导出这次对话"等涉及历史对话查找/管理/恢复的场景时使用。
+  继续之前的会话）、查看正在运行的对话。当用户说"我的对话""找到之前那个对话"
+  "恢复某次对话""正在运行的对话""看看智能体聊了什么""导出这次对话"等涉及
+  历史/进行中对话的查找/管理/恢复场景时使用。
 user-invocable: true
 ---
 
@@ -47,6 +48,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 备注 | `python <脚本> note <短ID> <文本>` |
 | 收藏/取消 | `python <脚本> star <短ID>` |
 | 列出有备注的 | `python <脚本> notes` |
+| 查看正在运行的对话 | `python <脚本> running [--minutes 30]` |
 | 查看数据源 | `python <脚本> paths` |
 
 **ID 支持前缀匹配**：`show 79b26d95` 或完整 UUID 均可。
@@ -98,6 +100,8 @@ python <脚本> export 79b26d95 --out "E:/CodeProject/notes/对话.md"
 - **Codex 会话管理**（归档/删除）用官方命令：`codex archive <id>` / `codex delete <id>`，
   skill 不做绕过。
 - **标题兜底**：无 AI 标题时取第一条用户消息，无消息则显示 `(无标题)`。
+- **running 判定**：活跃 = 最近 N 分钟有写入且未归档。Codex 后台 app-server 会 touch
+  旧会话文件造成误报，因此当 Codex 无交互进程时，其"活跃"记录会标注为后台服务活动。
 - **性能**：99 个对话全文搜索约 1~3 秒；list 秒回。
 - 本 skill 用本地 git 管理（`~/.claude/skills/agent-dialog_management/` 内 `git init`），
   只 commit 不 push。
