@@ -51,6 +51,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 列出有备注的 | `python <脚本> notes` |
 | 查看正在运行的对话 | `python <脚本> running [--minutes 30]` |
 | 搜索早期输入历史 | `python <脚本> hist <关键词> [--limit 30]` |
+| 启动监控面板 | `python <脚本> serve [--port 8765] [--no-browser]` |
 | 查看数据源 | `python <脚本> paths` |
 
 **ID 支持前缀匹配**：`show 79b26d95` 或完整 UUID 均可。
@@ -82,6 +83,15 @@ python <脚本> resume-cmd <短ID>
 
 > 注意：resume 是交互式命令，**不能在当前 Claude Code 会话内直接运行**（会占用/冲突），
 > 必须经 `cmd start` 开独立窗口，或提示用户手动运行输出的命令。
+
+### 3.4 监控面板（多终端同时看）
+```bash
+python <脚本> serve          # 启动浏览器面板 http://localhost:8765
+```
+一个页面同时展示所有活跃会话（Claude + Codex）：标题/项目/最近对话（3 秒自动刷新）、
+进程统计。**可向任一会话直接发指令**（卡片底部输入框）——内部用 `claude --resume <id> -p`
+或 `codex exec resume <id>` 非交互恢复执行，回复自动写回会话，面板刷新可见。
+指令处理较慢（取决于模型），面板会显示"AI 处理中…"。端口占用时用 `--port` 换。
 
 ### 3.5 搜索早期输入历史（history）
 2025-11 ~ 2026-05 的完整对话已被清理，但 `history.jsonl` 保留了你当时**每一次输入**（命令/提问/粘贴）。

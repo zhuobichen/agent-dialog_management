@@ -33,9 +33,13 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -582,6 +586,234 @@ def resume_command(rec):
 
 
 # ---------------------------------------------------------------------------
+# 监控面板（serve）：HTTP 服务 + 指令发送
+# ---------------------------------------------------------------------------
+
+SEND_TASKS = {}          # session_id -> {status, sent_at, message}
+SEND_LOCK = threading.Lock()
+
+
+def _run_send_task(rec, message):
+    """后台线程：向会话非交互发送指令（claude --resume -p / codex exec resume）"""
+    sid = rec["id"]
+    cwd = rec.get("cwd") or "."
+    if rec["agent"] == "claude":
+        cmd = ["cmd", "/c", "claude", "--resume", sid, "-p", message]
+    else:
+        cmd = ["cmd", "/c", "codex", "exec", "resume", sid, message]
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=180)
+        ok = proc.returncode == 0
+    except Exception:
+        ok = False
+    with SEND_LOCK:
+        SEND_TASKS[sid] = {"status": "done" if ok else "error",
+                           "finished_at": now_iso()}
+
+
+def send_to_session(rec, message):
+    """启动后台线程发送指令；同会话已有任务在处理则拒绝"""
+    sid = rec["id"]
+    with SEND_LOCK:
+        t = SEND_TASKS.get(sid)
+        if t and t.get("status") == "running":
+            return False, "该会话已有指令在处理中"
+        SEND_TASKS[sid] = {"status": "running", "sent_at": now_iso(),
+                           "message": message[:120]}
+    threading.Thread(target=_run_send_task, args=(rec, message), daemon=True).start()
+    return True, ""
+
+
+def status_payload():
+    """构建 /api/status 数据：活跃会话 + 进程 + 最近消息 + 任务状态"""
+    records = scan_all()
+    live = live_records(records, minutes=5)
+    sessions = []
+    for rec in live:
+        msgs = load_messages(rec)
+        last = [{"role": r, "text": t[:300]} for _, r, t in msgs[-6:]]
+        with SEND_LOCK:
+            task = SEND_TASKS.get(rec["id"], {})
+        sessions.append({
+            "id": rec["id"], "agent": rec["agent"], "title": rec["title"],
+            "project": rec["project"], "time": rec["time"],
+            "last_messages": last, "task": task,
+        })
+    return {
+        "processes": count_processes(),
+        "codex_interactive": codex_interactive_count(),
+        "sessions": sessions,
+        "now": now_iso(),
+    }
+
+
+class MonitorHandler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, obj):
+        self._send(200, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/status":
+            self._send_json(status_payload())
+        elif path == "/":
+            self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/send":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                self._send_json({"ok": False, "error": "请求解析失败"})
+                return
+            sid = (body.get("session_id") or "").strip()
+            msg = (body.get("message") or "").strip()
+            if not sid or not msg:
+                self._send_json({"ok": False, "error": "缺少 session_id 或 message"})
+                return
+            rec = find_record(scan_all(), sid)
+            if not rec:
+                self._send_json({"ok": False, "error": "会话不存在"})
+                return
+            ok, err = send_to_session(rec, msg)
+            self._send_json({"ok": ok, "error": err, "session_id": rec["id"]})
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass  # 静默，避免刷屏
+
+
+def serve(port=8765, open_browser=True):
+    """启动监控面板 HTTP 服务"""
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), MonitorHandler)
+    except OSError as e:
+        print(f"端口 {port} 被占用或不可用: {e}\n用 --port 换一个端口")
+        sys.exit(1)
+    print(f"AI 会话监控面板已启动: http://localhost:{port}  (Ctrl+C 停止)")
+    if open_browser:
+        webbrowser.open(f"http://localhost:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止监控面板")
+
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 会话监控面板</title>
+<style>
+  :root{--bg:#0f172a;--card:#1a2438;--line:#2c3a52;--txt:#e2e8f0;--muted:#94a3b8}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:linear-gradient(160deg,#0b1222,#101b33);color:var(--txt);
+       font-family:"Segoe UI","Microsoft YaHei",sans-serif;padding:24px;min-height:100vh}
+  .top{max-width:1400px;margin:0 auto 20px}
+  h1{font-size:1.5rem;background:linear-gradient(90deg,#38bdf8,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .stats{display:flex;gap:18px;margin-top:10px;font-size:.9rem;color:var(--muted);flex-wrap:wrap}
+  .stats b{color:#fff}
+  .grid{max-width:1400px;margin:0 auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:8px}
+  .chead{display:flex;align-items:center;gap:8px}
+  .ctitle{font-weight:600;font-size:.95rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ag{font-size:.68rem;padding:2px 8px;border-radius:4px;font-weight:600}
+  .ag.c{background:rgba(56,189,248,.15);color:#38bdf8}
+  .ag.x{background:rgba(167,139,250,.15);color:#a78bfa}
+  .dot{width:9px;height:9px;border-radius:50%;background:#34d399;flex-shrink:0}
+  .cmeta{font-size:.75rem;color:var(--muted)}
+  .cmsgs{background:#0d1626;border-radius:10px;padding:8px;max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+  .msg{font-size:.82rem;line-height:1.5;display:flex;gap:6px;align-items:flex-start}
+  .msg .who{flex-shrink:0}
+  .msg.user{color:#7dd3fc}
+  .msg.assistant{color:#cbd5e1}
+  .task-run{color:#fbbf24;font-size:.8rem}
+  .task-err{color:#f87171;font-size:.8rem}
+  .cinput{display:flex;gap:8px}
+  .cinput input{flex:1;background:#0d1626;border:1px solid var(--line);border-radius:8px;color:var(--txt);
+       padding:8px 10px;font-size:.85rem;outline:none}
+  .cinput input:focus{border-color:#38bdf8}
+  .cinput button{background:linear-gradient(90deg,#0e7490,#1d4ed8);border:none;border-radius:8px;
+       color:#fff;padding:8px 14px;font-size:.85rem;cursor:pointer}
+  .cinput button:hover{opacity:.9}
+  .empty{text-align:center;color:var(--muted);padding:60px;font-size:1rem}
+  .hidden{display:none}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>AI 会话监控面板</h1>
+  <div class="stats">
+    <span>Claude 进程: <b id="nClaude">-</b></span>
+    <span>Codex 交互: <b id="nCodex">-</b></span>
+    <span>活跃会话: <b id="nSess">-</b></span>
+    <span id="refreshed">-</span>
+  </div>
+</div>
+<div class="grid" id="grid"></div>
+<div id="empty" class="empty hidden">当前无活跃会话</div>
+<script>
+async function load(){
+  try{
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    document.getElementById('nClaude').textContent = d.processes['claude.exe']||0;
+    document.getElementById('nCodex').textContent = d.codex_interactive||0;
+    document.getElementById('nSess').textContent = d.sessions.length;
+    document.getElementById('refreshed').textContent = '刷新: '+d.now;
+    render(d.sessions);
+  }catch(e){}
+}
+function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function render(sessions){
+  const grid = document.getElementById('grid');
+  document.getElementById('empty').classList.toggle('hidden', sessions.length>0);
+  grid.innerHTML='';
+  sessions.forEach(s=>{
+    const card=document.createElement('div');card.className='card';
+    const badge=s.agent==='claude'?'<span class="ag c">Claude</span>':'<span class="ag x">Codex</span>';
+    const msgs=(s.last_messages.map(m=>'<div class="msg '+m.role+'"><span class="who">'+(m.role==='user'?'👤':'🤖')+'</span><span>'+esc(m.text)+'</span></div>').join(''))||'<div class="muted">（暂无对话内容）</div>';
+    const task=s.task.status==='running'?'<div class="task-run">⏳ AI 处理中…</div>':(s.task.status==='error'?'<div class="task-err">⚠️ 指令执行出错</div>':'');
+    card.innerHTML='<div class="chead"><div class="ctitle" title="'+esc(s.title)+'">'+esc(s.title)+'</div>'+badge+'<span class="dot"></span></div>'+
+      '<div class="cmeta">'+esc(s.project)+' · '+s.time+'</div>'+
+      '<div class="cmsgs">'+msgs+'</div>'+task+
+      '<div class="cinput"><input placeholder="向此会话发指令…" data-id="'+s.id+'"><button data-id="'+s.id+'">发送</button></div>';
+    grid.appendChild(card);
+  });
+  grid.querySelectorAll('button').forEach(b=>b.onclick=()=>send(b.dataset.id,b.previousElementSibling.value));
+  grid.querySelectorAll('input').forEach(i=>i.onkeydown=e=>{if(e.key==='Enter')send(i.dataset.id,i.value);});
+}
+async function send(id,msg){
+  if(!msg||!msg.trim())return;
+  try{
+    await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:id,message:msg})});
+  }catch(e){}
+  load();
+}
+load();
+setInterval(load,3000);
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -630,6 +862,10 @@ def main():
     p.add_argument("--minutes", type=int, default=30, help="活跃判定窗口（分钟，默认30）")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("serve", help="启动多终端会话监控面板（浏览器）")
+    p.add_argument("--port", type=int, default=8765, help="端口（默认8765）")
+    p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+
     p = sub.add_parser("paths", help="显示数据源路径")
 
     args = ap.parse_args()
@@ -642,6 +878,10 @@ def main():
         print("早期输入历史:     ", HOME / ".claude" / "history.jsonl")
         print("备注存储:         ", NOTES_FILE)
         print(f"当前共索引 {len(records)} 个对话")
+        return
+
+    if args.cmd == "serve":
+        serve(port=args.port, open_browser=not args.no_browser)
         return
 
     if args.cmd == "hist":
