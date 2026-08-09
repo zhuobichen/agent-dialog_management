@@ -625,14 +625,93 @@ def send_to_session(rec, message):
     return True, ""
 
 
+_STATUS_CACHE = {"ts": 0.0, "data": None}
+_STATUS_LOCK = threading.Lock()
+_PROCS_CACHE = {"ts": 0.0, "data": None}
+_SCAN_CACHE = {"ts": 0.0, "data": None}
+
+
+def _cached(fn, cache, ttl):
+    """带 TTL 的组件缓存：进程统计(15s)、会话扫描(10s)"""
+    now = time.time()
+    with _STATUS_LOCK:
+        if cache["data"] is not None and now - cache["ts"] < ttl:
+            return cache["data"]
+    data = fn()
+    with _STATUS_LOCK:
+        cache["ts"] = time.time()
+        cache["data"] = data
+    return data
+
+
+def _cached_procs():
+    return _cached(lambda: (count_processes(), codex_interactive_count()),
+                   _PROCS_CACHE, 15)
+
+
+def _cached_scan():
+    return _cached(scan_all, _SCAN_CACHE, 10)
+
+
+def tail_messages(rec, n=6):
+    """从 JSONL 末尾反向读取最近 n 条 user/assistant 文本（比 load_messages 快，
+    只读文件末尾一小段，适合监控面板高频轮询）"""
+    fp = Path(rec.get("_file", ""))
+    if not fp.is_file():
+        return []
+    result = []
+    try:
+        size = fp.stat().st_size
+        read_size = min(size, 200 * 1024)   # 最多读末尾 200KB
+        with open(fp, "rb") as f:
+            f.seek(size - read_size)
+            data = f.read(read_size).decode("utf-8", errors="replace")
+        for line in reversed(data.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            t = d.get("type")
+            if t in ("user", "assistant"):
+                m = d.get("message")
+                text = text_from_blocks(m.get("content")) if isinstance(m, dict) else ""
+                if text:
+                    result.append((d.get("timestamp", ""), t, text))
+            elif t == "response_item":      # Codex
+                p = d.get("payload") or {}
+                if p.get("type") == "message" and p.get("role") in ("user", "assistant"):
+                    text = text_from_blocks(p.get("content"))
+                    if text:
+                        result.append((d.get("timestamp", ""), p["role"], text))
+            if len(result) >= n:
+                break
+        result.reverse()
+    except Exception:
+        pass
+    return result
+
+
 def status_payload():
-    """构建 /api/status 数据：活跃会话 + 进程 + 最近消息 + 任务状态"""
-    records = scan_all()
+    """构建 /api/status 数据：活跃会话 + 进程 + 最近消息 + 任务状态（3s TTL 缓存）"""
+    with _STATUS_LOCK:
+        if _STATUS_CACHE["data"] is not None and time.time() - _STATUS_CACHE["ts"] < 3.0:
+            return _STATUS_CACHE["data"]
+    data = _build_status()
+    with _STATUS_LOCK:
+        _STATUS_CACHE["ts"] = time.time()
+        _STATUS_CACHE["data"] = data
+    return data
+
+
+def _build_status():
+    records = _cached_scan()
     live = live_records(records, minutes=5)
     sessions = []
     for rec in live:
-        msgs = load_messages(rec)
-        last = [{"role": r, "text": t[:300]} for _, r, t in msgs[-6:]]
+        msgs = tail_messages(rec, 6)
+        last = [{"role": r, "text": t[:300]} for _, r, t in msgs]
         with SEND_LOCK:
             task = SEND_TASKS.get(rec["id"], {})
         sessions.append({
@@ -640,9 +719,10 @@ def status_payload():
             "project": rec["project"], "time": rec["time"],
             "last_messages": last, "task": task,
         })
+    procs, codex_inter = _cached_procs()
     return {
-        "processes": count_processes(),
-        "codex_interactive": codex_interactive_count(),
+        "processes": procs,
+        "codex_interactive": codex_inter,
         "sessions": sessions,
         "now": now_iso(),
     }
@@ -703,6 +783,12 @@ def serve(port=8765, open_browser=True):
     except OSError as e:
         print(f"端口 {port} 被占用或不可用: {e}\n用 --port 换一个端口")
         sys.exit(1)
+    # 同步预热缓存：首次数据构建需几秒（扫描+进程查询），完成后首请求即秒回
+    print("正在构建初始数据（首次约几秒）...")
+    try:
+        _build_status()
+    except Exception as e:
+        print(f"预热数据构建失败（不影响服务）: {e}")
     print(f"AI 会话监控面板已启动: http://localhost:{port}  (Ctrl+C 停止)")
     if open_browser:
         webbrowser.open(f"http://localhost:{port}")
