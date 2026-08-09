@@ -653,6 +653,58 @@ def _cached_scan():
     return _cached(scan_all, _SCAN_CACHE, 10)
 
 
+_CLAUDE_PIDS_CACHE = {"ts": 0.0, "data": None}
+_RUNNING_CLAUDE_CACHE = {"ts": 0.0, "data": None}
+
+
+def _claude_pids():
+    """当前运行的 claude.exe 进程 PID 集合"""
+    ps = ("Get-CimInstance Win32_Process | "
+          "Where-Object { $_.Name -eq 'claude.exe' } | "
+          "ForEach-Object { $_.ProcessId }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=20).stdout
+        return set(int(x) for x in out.split() if x.strip().isdigit())
+    except Exception:
+        return set()
+
+
+def _cached_claude_pids():
+    return _cached(_claude_pids, _CLAUDE_PIDS_CACHE, 10)
+
+
+def running_claude_sessions():
+    """运行中的 Claude 会话：~/.claude/sessions/<pid>.json ∩ 当前 claude.exe 进程。
+
+    Claude Code 每个运行中会话在 ~/.claude/sessions/ 有一个 <pid>.json，
+    记录 sessionId/status（idle/running），据此能列出所有开启中的 Claude 终端。
+    """
+    pids = _cached_claude_pids()
+    if not pids:
+        return []
+    sdir = HOME / ".claude" / "sessions"
+    result = []
+    if sdir.is_dir():
+        for f in sdir.glob("*.json"):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                if d.get("pid") in pids and d.get("sessionId"):
+                    result.append({
+                        "sessionId": d["sessionId"],
+                        "cwd": d.get("cwd", ""),
+                        "status": d.get("status", "idle"),
+                        "updatedAt": d.get("updatedAt", 0),
+                    })
+            except Exception:
+                continue
+    return result
+
+
+def _cached_running_claude():
+    return _cached(running_claude_sessions, _RUNNING_CLAUDE_CACHE, 10)
+
+
 def tail_messages(rec, n=6):
     """从 JSONL 末尾反向读取最近 n 条 user/assistant 文本（比 load_messages 快，
     只读文件末尾一小段，适合监控面板高频轮询）"""
@@ -707,19 +759,40 @@ def status_payload():
 
 def _build_status():
     records = _cached_scan()
-    live = live_records(records, minutes=5)
+    procs, codex_inter = _cached_procs()
+    rec_by_id = {r["id"]: r for r in records}
+    seen = set()
     sessions = []
-    for rec in live:
-        msgs = tail_messages(rec, 6)
-        last = [{"role": r, "text": t[:300]} for _, r, t in msgs]
+
+    def add_session(sid, agent, title, project, status):
+        if sid in seen:
+            return
+        seen.add(sid)
+        rec = rec_by_id.get(sid)
+        last = []
+        if rec:
+            last = [{"role": r, "text": t[:300]} for _, r, t in tail_messages(rec, 6)]
         with SEND_LOCK:
-            task = SEND_TASKS.get(rec["id"], {})
+            task = SEND_TASKS.get(sid, {})
         sessions.append({
-            "id": rec["id"], "agent": rec["agent"], "title": rec["title"],
-            "project": rec["project"], "time": rec["time"],
+            "id": sid, "agent": agent, "title": title, "project": project,
+            "time": rec["time"] if rec else "", "status": status,
             "last_messages": last, "task": task,
         })
-    procs, codex_inter = _cached_procs()
+
+    # 1) 所有运行中的 Claude 会话（含空闲），按进程会话表
+    for rs in _cached_running_claude():
+        sid = rs["sessionId"]
+        rec = rec_by_id.get(sid)
+        add_session(sid, "claude",
+                    rec["title"] if rec else sid[:8],
+                    rec["project"] if rec else rs["cwd"],
+                    rs.get("status", "idle"))
+
+    # 2) 最近活跃但未在上面的会话（含 Codex 与遗漏的 Claude）
+    for rec in live_records(records, minutes=5):
+        add_session(rec["id"], rec["agent"], rec["title"], rec["project"], "recent")
+
     return {
         "processes": procs,
         "codex_interactive": codex_inter,
@@ -821,6 +894,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .ag.c{background:rgba(56,189,248,.15);color:#38bdf8}
   .ag.x{background:rgba(167,139,250,.15);color:#a78bfa}
   .dot{width:9px;height:9px;border-radius:50%;background:#34d399;flex-shrink:0}
+  .st{font-size:.7rem;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:0 6px;white-space:nowrap}
+  .st.idle{color:#94a3b8}
+  .st.live{color:#34d399}
   .cmeta{font-size:.75rem;color:var(--muted)}
   .cmsgs{background:#0d1626;border-radius:10px;padding:8px;max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
   .msg{font-size:.82rem;line-height:1.5;display:flex;gap:6px;align-items:flex-start}
@@ -875,7 +951,11 @@ function render(sessions){
     const badge=s.agent==='claude'?'<span class="ag c">Claude</span>':'<span class="ag x">Codex</span>';
     const msgs=(s.last_messages.map(m=>'<div class="msg '+m.role+'"><span class="who">'+(m.role==='user'?'👤':'🤖')+'</span><span>'+esc(m.text)+'</span></div>').join(''))||'<div class="muted">（暂无对话内容）</div>';
     const task=s.task.status==='running'?'<div class="task-run">⏳ AI 处理中…</div>':(s.task.status==='error'?'<div class="task-err">⚠️ 指令执行出错</div>':'');
-    card.innerHTML='<div class="chead"><div class="ctitle" title="'+esc(s.title)+'">'+esc(s.title)+'</div>'+badge+'<span class="dot"></span></div>'+
+    const live=(s.status==='running'||s.status==='recent');
+    const stTxt=s.status==='running'?'运行中':(s.status==='recent'?'活跃':'空闲');
+    const dot='<span class="dot" style="background:'+(live?'#34d399':'#94a3b8')+'"></span>';
+    const st='<span class="st '+(live?'live':'idle')+'">'+stTxt+'</span>';
+    card.innerHTML='<div class="chead"><div class="ctitle" title="'+esc(s.title)+'">'+esc(s.title)+'</div>'+badge+st+dot+'</div>'+
       '<div class="cmeta">'+esc(s.project)+' · '+s.time+'</div>'+
       '<div class="cmsgs">'+msgs+'</div>'+task+
       '<div class="cinput"><input placeholder="向此会话发指令…" data-id="'+s.id+'"><button data-id="'+s.id+'">发送</button></div>';
