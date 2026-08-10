@@ -27,6 +27,7 @@
 """
 
 import argparse
+import base64
 import glob
 import json
 import os
@@ -573,22 +574,25 @@ def codex_interactive_count():
 
 
 def resume_command(rec):
-    """输出在当前 Windows Terminal 窗口新标签启动会话的命令（wt -d 方案）。
+    """输出在当前 Windows Terminal 窗口新标签启动会话的命令（wt -d + EncodedCommand）。
 
     经验（2026-08-10 实测）：
     - 用 `wt -w 0 new-tab -d <目录>` 在**当前 WT 窗口**开新标签，不弹独立窗口
-    - `-d` 设置工作目录，**不要**用 `Set-Location '...'; claude ...`
-      （分号在 wt 参数里会被拆开导致 claude 不启动）
-    - 命令里不要加 `--title` 中文标题再手动传，避免编码问题
+    - 启动前先 `Remove-Item Env:CLAUDE_CODE_CHILD_SESSION`，否则 claude 继承当前
+      会话的"子会话"标记 → 显示 "Transcript saving is off"，不保存对话记录
+    - 命令用 `-EncodedCommand`（base64 UTF-16LE）：**分号在 wt -Command 参数里
+      会被拆开**导致 claude 不启动，编码后安全
     """
     wt = r'C:\Users\chenlizhuo\AppData\Local\Microsoft\WindowsApps\wt.exe'
     sid = rec["id"]
     cwd = rec.get("cwd") or "."
     if rec["agent"] == "claude":
-        cmd = f"claude --dangerously-skip-permissions --resume {sid}"
+        inner = f"claude --dangerously-skip-permissions --resume {sid}"
     else:
-        cmd = f"codex resume {sid}"
-    return f'"{wt}" -w 0 new-tab -d "{cwd}" powershell -NoExit -Command "{cmd}"'
+        inner = f"codex resume {sid}"
+    ps = f"Remove-Item Env:CLAUDE_CODE_CHILD_SESSION -ErrorAction SilentlyContinue; {inner}"
+    b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
+    return f'"{wt}" -w 0 new-tab -d "{cwd}" powershell -NoExit -EncodedCommand {b64}'
 
 
 # ---------------------------------------------------------------------------
