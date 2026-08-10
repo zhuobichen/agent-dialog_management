@@ -52,6 +52,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 查看正在运行的对话 | `python <脚本> running [--minutes 30]` |
 | 搜索早期输入历史 | `python <脚本> hist <关键词> [--limit 30]` |
 | 启动监控面板 | `python <脚本> serve [--port 8765] [--no-browser]` |
+| 关闭所有 Claude 会话 | `python <脚本> shutdown [--yes]`（更新 claude 后重启用，输出恢复清单） |
 | 查看数据源 | `python <脚本> paths` |
 
 **ID 支持前缀匹配**：`show 79b26d95` 或完整 UUID 均可。

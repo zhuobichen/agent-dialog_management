@@ -705,6 +705,32 @@ def _cached_running_claude():
     return _cached(running_claude_sessions, _RUNNING_CLAUDE_CACHE, 10)
 
 
+def shutdown_claude(force=False):
+    """关闭所有运行中的 Claude 会话（更新 claude 后想全部重启时用），
+    并输出恢复清单（新版本 claude --resume 逐个重开）。"""
+    sessions = running_claude_sessions()
+    if not sessions:
+        print("当前没有运行中的 Claude 会话。")
+        return
+    print(f"检测到 {len(sessions)} 个运行中的 Claude 会话:")
+    for i, s in enumerate(sessions, 1):
+        print(f"  {i}. {s['sessionId'][:8]}  cwd={s['cwd']}")
+    if not force:
+        ans = input("\n确认关闭所有 claude 进程？(y/N): ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("已取消")
+            return
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "claude.exe"],
+                       capture_output=True, timeout=30)
+    except Exception as e:
+        print(f"关闭进程时出错: {e}")
+    print("\n已关闭所有 Claude 会话。\n")
+    print("更新后可用以下命令逐个重新打开（新版本 resume，会话内容不丢）:")
+    for i, s in enumerate(sessions, 1):
+        print(f"  {i}. cd /d \"{s['cwd']}\" && claude --resume {s['sessionId']}")
+
+
 def tail_messages(rec, n=6):
     """从 JSONL 末尾反向读取最近 n 条 user/assistant 文本（比 load_messages 快，
     只读文件末尾一小段，适合监控面板高频轮询）"""
@@ -1032,6 +1058,9 @@ def main():
     p.add_argument("--port", type=int, default=8765, help="端口（默认8765）")
     p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
 
+    p = sub.add_parser("shutdown", help="关闭所有运行中的 Claude 会话并输出恢复清单")
+    p.add_argument("--yes", action="store_true", help="跳过确认直接关闭")
+
     p = sub.add_parser("paths", help="显示数据源路径")
 
     args = ap.parse_args()
@@ -1048,6 +1077,10 @@ def main():
 
     if args.cmd == "serve":
         serve(port=args.port, open_browser=not args.no_browser)
+        return
+
+    if args.cmd == "shutdown":
+        shutdown_claude(force=args.yes)
         return
 
     if args.cmd == "hist":
