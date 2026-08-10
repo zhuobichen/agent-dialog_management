@@ -573,16 +573,22 @@ def codex_interactive_count():
 
 
 def resume_command(rec):
-    """输出 Git Bash 兼容命令：先 cd 到会话原目录，再开新 cmd 窗口恢复。
+    """输出在当前 Windows Terminal 窗口新标签启动会话的命令（wt -d 方案）。
 
-    已在 Windows/Git Bash 实测可用：`cmd //c "start cmd /k ..."`（不加空标题
-    `""`，否则 start 参数解析出错导致拒绝访问）。cd 放在 bash 层，新 cmd 窗口
-    继承该 cwd，避免 cmd 嵌套引号冲突。
+    经验（2026-08-10 实测）：
+    - 用 `wt -w 0 new-tab -d <目录>` 在**当前 WT 窗口**开新标签，不弹独立窗口
+    - `-d` 设置工作目录，**不要**用 `Set-Location '...'; claude ...`
+      （分号在 wt 参数里会被拆开导致 claude 不启动）
+    - 命令里不要加 `--title` 中文标题再手动传，避免编码问题
     """
-    target = f"claude --resume {rec['id']}" if rec["agent"] == "claude" \
-        else f"codex resume {rec['id']}"
+    wt = r'C:\Users\chenlizhuo\AppData\Local\Microsoft\WindowsApps\wt.exe'
+    sid = rec["id"]
     cwd = rec.get("cwd") or "."
-    return f'cd "{cwd}" && cmd //c "start cmd /k {target}"'
+    if rec["agent"] == "claude":
+        cmd = f"claude --dangerously-skip-permissions --resume {sid}"
+    else:
+        cmd = f"codex resume {sid}"
+    return f'"{wt}" -w 0 new-tab -d "{cwd}" powershell -NoExit -Command "{cmd}"'
 
 
 # ---------------------------------------------------------------------------

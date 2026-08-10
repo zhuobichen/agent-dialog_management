@@ -73,17 +73,19 @@ python <脚本> search 邮箱
 ```
 返回命中对话 + 上下文片段。用户确认后 `show` 看全文。
 
-### 3. 恢复对话（新开终端窗口）
+### 3. 恢复对话（在当前 Windows Terminal 新标签）
 ```bash
 python <脚本> resume-cmd <短ID>
 ```
-脚本会输出一条 Git Bash 命令（先 `cd` 到会话原工作目录，再
-`cmd //c "start cmd /k claude --resume <id>"` 或 `codex resume <id>`）。
-**执行这条输出**，会弹出新 cmd 窗口并恢复该会话——这正是 Claude Code / Codex
-官方支持的恢复机制。然后告知用户：新窗口已打开，可继续之前的工作。
+脚本会输出一条命令（基于 `wt.exe`）：
+`"C:\Users\<用户>\AppData\Local\Microsoft\WindowsApps\wt.exe" -w 0 new-tab -d "<cwd>" powershell -NoExit -Command "claude --dangerously-skip-permissions --resume <id>"`
+**执行这条输出**，会在**当前 Windows Terminal 窗口**新开一个标签页并恢复该会话
+（不弹独立窗口）。codex 会话用 `codex resume <id>`。
 
-> 注意：resume 是交互式命令，**不能在当前 Claude Code 会话内直接运行**（会占用/冲突），
-> 必须经 `cmd start` 开独立窗口，或提示用户手动运行输出的命令。
+> 经验（2026-08-10）：用 `wt -w 0 new-tab -d <目录>` 开当前窗口新标签；
+> **不要**用 `Set-Location '...'; claude ...`（分号在 wt 参数里会被拆开导致 claude 不启动），
+> 也不要用 `Start-Process powershell`（会弹独立系统窗口，用户不喜欢）。
+> resume 是交互式命令，不能在当前 Claude Code 会话内直接运行。
 
 ### 3.4 监控面板（多终端同时看）
 ```bash
