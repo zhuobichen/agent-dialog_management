@@ -583,7 +583,10 @@ def resume_command(rec):
     - 命令用 `-EncodedCommand`（base64 UTF-16LE）：**分号在 wt -Command 参数里
       会被拆开**导致 claude 不启动，编码后安全
     """
-    wt = r'C:\Users\chenlizhuo\AppData\Local\Microsoft\WindowsApps\wt.exe'
+    wt = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
+        r"Microsoft\WindowsApps\wt.exe",
+    )
     sid = rec["id"]
     cwd = rec.get("cwd") or "."
     if rec["agent"] == "claude":
