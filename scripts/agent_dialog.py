@@ -1030,7 +1030,7 @@ def main():
     p.add_argument("--agent", choices=["claude", "codex"])
     p.add_argument("--limit", type=int)
     p.add_argument("--json", action="store_true")
-    p.add_argument("--archived", action="store_true", help="包含已归档对话（默认已含）")
+    p.add_argument("--archived", action="store_true", help="只看已归档对话")
 
     p = sub.add_parser("search", help="全文搜索")
     p.add_argument("pattern")
@@ -1159,6 +1159,8 @@ def main():
         return
 
     if args.cmd == "list":
+        if getattr(args, "archived", False):
+            records = [r for r in records if r.get("archived")]
         if args.json:
             print_json(records)
         else:
