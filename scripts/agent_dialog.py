@@ -55,6 +55,8 @@ CODEX_ARCHIVE_DIR = HOME / ".codex" / "archived_sessions"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 STATE_DIR = SKILL_DIR / "state"
 NOTES_FILE = STATE_DIR / "notes.json"
+OPEN_FILE = STATE_DIR / "open.json"      # 已打开会话清单（restore 用）
+MAX_OPEN = 30                            # 清单最多保留条数
 
 MAX_TITLE = 60       # 列表里标题显示宽度
 SHOW_MSG_LIMIT = 600  # show 时单条消息默认截断宽度
@@ -118,6 +120,64 @@ def save_notes(notes):
     NOTES_FILE.write_text(
         json.dumps(notes, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+# --- 已打开会话清单（state/open.json）--------------------------------------
+# 为什么需要它：所有会话都用 `wt -w 0 new-tab` 开在**同一扇** Windows Terminal
+# 窗口里，关一次窗口就全没了；而"当时开了哪些"没有任何记录，只能靠 mtime /
+# 事件日志反推（2026-10-09 关机、2026-10-10 误关各踩一次）。
+# 现在每次 resume-cmd / restore 都把会话记进清单，之后 `restore` 一条命令重开。
+
+def load_open():
+    """已打开会话清单，最近打开的在前。返回 [{id, agent, cwd, title, openedAt, window}]"""
+    if not OPEN_FILE.exists():
+        return []
+    try:
+        d = json.loads(OPEN_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    raw = d.get("sessions", d) if isinstance(d, dict) else d
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for s in raw:
+        if isinstance(s, str):           # 兼容早期只存 id 的格式
+            out.append({"id": s, "agent": "claude", "cwd": "", "title": ""})
+        elif isinstance(s, dict) and s.get("id"):
+            out.append(s)
+    return out
+
+
+def save_open(sessions):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OPEN_FILE.write_text(
+        json.dumps({"sessions": sessions[:MAX_OPEN]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def record_open(recs, window="tab"):
+    """把刚打开的会话记入清单：按 id 去重、最近在前、超出 MAX_OPEN 截断"""
+    entries = [{
+        "id": r["id"],
+        "agent": r.get("agent", "claude"),
+        "cwd": r.get("cwd", ""),
+        "title": (r.get("title") or "")[:80],
+        "openedAt": now_iso(),
+        "window": window,
+    } for r in recs]
+    new_ids = {e["id"] for e in entries}
+    kept = [s for s in load_open() if s["id"] not in new_ids]
+    save_open(entries + kept)
+    return entries
+
+
+def alive_session_ids():
+    """当前活着的 Claude 会话 id 集合（进程 ∩ ~/.claude/sessions/<pid>.json）"""
+    try:
+        return {s["sessionId"] for s in _cached_running_claude()}
+    except Exception:
+        return set()
 
 
 # ---------------------------------------------------------------------------
@@ -573,29 +633,101 @@ def codex_interactive_count():
         return 0
 
 
-def resume_command(rec):
-    """输出在当前 Windows Terminal 窗口新标签启动会话的命令（wt -d + EncodedCommand）。
+# Windows Terminal 可执行文件：从 LOCALAPPDATA 动态解析（不写死用户名/盘符）
+WT_EXE = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
+    r"Microsoft\WindowsApps\wt.exe",
+)
 
-    经验（2026-08-10 实测）：
-    - 用 `wt -w 0 new-tab -d <目录>` 在**当前 WT 窗口**开新标签，不弹独立窗口
-    - 启动前先 `Remove-Item Env:CLAUDE_CODE_CHILD_SESSION`，否则 claude 继承当前
-      会话的"子会话"标记 → 显示 "Transcript saving is off"，不保存对话记录
-    - 命令用 `-EncodedCommand`（base64 UTF-16LE）：**分号在 wt -Command 参数里
-      会被拆开**导致 claude 不启动，编码后安全
+
+def resume_argv(rec, window="tab"):
+    """启动会话的 wt 参数列表。
+
+    执行走这个（不经过 shell）：中文 cwd 与引号直接交给 CreateProcess，
+    省掉 cmd.exe / Git Bash 两层解析。
+
+    window="tab"（默认）：`wt -w 0`   —— 当前 WT 窗口开新标签
+    window="new"        ：`wt -w new` —— 独立 WT 窗口（关一扇不会带走其它会话）
     """
-    wt = os.path.join(
-        os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
-        r"Microsoft\WindowsApps\wt.exe",
-    )
     sid = rec["id"]
     cwd = rec.get("cwd") or "."
     if rec["agent"] == "claude":
         inner = f"claude --dangerously-skip-permissions --resume {sid}"
     else:
         inner = f"codex resume {sid}"
+    # 启动前清掉 CLAUDE_CODE_CHILD_SESSION：否则 claude 继承当前会话的"子会话"标记
+    # → 显示 "Transcript saving is off"、不保存对话记录
     ps = f"Remove-Item Env:CLAUDE_CODE_CHILD_SESSION -ErrorAction SilentlyContinue; {inner}"
     b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
-    return f'"{wt}" -w 0 new-tab -d "{cwd}" powershell -NoExit -EncodedCommand {b64}'
+    wflag = "-w new" if window == "new" else "-w 0"
+    return [WT_EXE, wflag, "new-tab", "-d", cwd,
+            "powershell", "-NoExit", "-EncodedCommand", b64]
+
+
+def resume_command(rec, window="tab"):
+    """输出可直接复制/eval 的命令行字符串（与 resume_argv 等价）。
+
+    经验（2026-08-10 实测）：
+    - 命令用 `-EncodedCommand`（base64 UTF-16LE）：**分号在 wt -Command 参数里
+      会被拆开**导致 claude 不启动，编码后安全
+    """
+    wt, wflag, _, _, cwd, _, _, _, b64 = resume_argv(rec, window)
+    return f'"{wt}" {wflag} new-tab -d "{cwd}" powershell -NoExit -EncodedCommand {b64}'
+
+
+def restore_sessions(only_missing=True, window="tab", dry_run=False):
+    """重开 state/open.json 清单里的会话（误关窗口 / 重启后一条命令恢复）。
+
+    only_missing=True（默认）：跳过当前还活着的会话，避免开重复标签。
+    """
+    entries = load_open()
+    if not entries:
+        print(f"清单为空（{OPEN_FILE}）")
+        print("清单会在每次 resume-cmd / restore / shutdown 时自动记录。")
+        return
+    records = scan_all(None)
+    by_id = {r["id"]: r for r in records}
+    alive = alive_session_ids()
+    todo, skipped, missing = [], [], []
+    for e in entries:
+        sid = e["id"]
+        if only_missing and sid in alive:
+            skipped.append(e)
+        elif sid not in by_id:
+            missing.append(e)          # 会话文件已不存在（被删/清理）
+        else:
+            todo.append(by_id[sid])
+
+    print(f"清单 {len(entries)} 条 → 待重开 {len(todo)}，已在运行 {len(skipped)}，"
+          f"找不到会话文件 {len(missing)}")
+    for e in skipped:
+        print(f"  · 已在运行，跳过  {e['id'][:8]}  {e.get('cwd','')}")
+    for e in missing:
+        print(f"  ! 会话文件已不存在  {e['id'][:8]}  {e.get('cwd','')}")
+    if not todo:
+        print("\n没有需要重开的会话。")
+        return
+    print()
+    reopened, failed = [], 0
+    for rec in todo:
+        print(f"  {rec['id'][:8]}  {rec.get('cwd','')}")
+        if dry_run:
+            print(f"      {resume_command(rec, window)}")
+            continue
+        try:
+            subprocess.run(resume_argv(rec, window), timeout=30, check=False)
+            reopened.append(rec)
+        except Exception as ex:
+            failed += 1
+            print(f"      启动失败: {ex}")
+    if dry_run:
+        print("\n（--dry-run：只打印，未执行）")
+        return
+    if reopened:
+        record_open(reopened, window=window)
+    print(f"\n已重开 {len(reopened)} 个会话（window={window}）"
+          + (f"，失败 {failed} 个" if failed else ""))
+
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +850,26 @@ def _cached_running_claude():
     return _cached(running_claude_sessions, _RUNNING_CLAUDE_CACHE, 10)
 
 
+def snapshot_open():
+    """把当前运行中的 Claude 会话记为清单（不关闭任何东西）。
+
+    清单默认只认得"经本 skill 打开过"的会话；本命令用于把此刻已经开着的
+    （比如手动开的、或本功能上线前就存在的）一并纳入，之后 restore 才能覆盖。
+    """
+    sessions = running_claude_sessions()
+    if not sessions:
+        print("当前没有运行中的 Claude 会话，清单未改动。")
+        return
+    titles = {r["id"]: r.get("title", "") for r in scan_all("claude")}
+    recs = [{"id": s["sessionId"], "agent": "claude", "cwd": s["cwd"],
+             "title": titles.get(s["sessionId"], "")} for s in sessions]
+    record_open(recs)
+    print(f"已把 {len(recs)} 个运行中的会话记入清单: {OPEN_FILE}")
+    for r in recs:
+        print(f"  {r['id'][:8]}  {r['cwd']}")
+    print(f"\n之后误关窗口/重启，可用 restore 一条命令重开。")
+
+
 def shutdown_claude(force=False):
     """关闭所有运行中的 Claude 会话（更新 claude 后想全部重启时用），
     并输出恢复清单（新版本 claude --resume 逐个重开）。"""
@@ -733,13 +885,20 @@ def shutdown_claude(force=False):
         if ans not in ("y", "yes"):
             print("已取消")
             return
+    # 关之前先把"当前开着哪些"存成清单 —— 之后 `restore` 一条命令全开回来
+    titles = {r["id"]: r.get("title", "") for r in scan_all("claude")}
+    record_open([{"id": s["sessionId"], "agent": "claude", "cwd": s["cwd"],
+                  "title": titles.get(s["sessionId"], "")} for s in sessions])
+    print(f"\n已把这 {len(sessions)} 个会话记入清单: {OPEN_FILE}")
     try:
         subprocess.run(["taskkill", "/F", "/IM", "claude.exe"],
                        capture_output=True, timeout=30)
     except Exception as e:
         print(f"关闭进程时出错: {e}")
     print("\n已关闭所有 Claude 会话。\n")
-    print("更新后可用以下命令逐个重新打开（新版本 resume，会话内容不丢）:")
+    print("重开全部（一条命令，读上面那份清单）:")
+    print(f"  python \"{Path(__file__).resolve()}\" restore")
+    print("\n或逐个重开（会话内容不丢）:")
     for i, s in enumerate(sessions, 1):
         print(f"  {i}. cd /d \"{s['cwd']}\" && claude --resume {s['sessionId']}")
 
@@ -1057,6 +1216,8 @@ def main():
 
     p = sub.add_parser("resume-cmd", help="输出恢复命令")
     p.add_argument("id")
+    p.add_argument("--window", choices=["tab", "new"], default="tab",
+                   help="tab=当前窗口新标签（默认）；new=独立 WT 窗口")
 
     p = sub.add_parser("hist", help="搜索早期输入历史（history.jsonl，2025-11至今）")
     p.add_argument("pattern")
@@ -1076,6 +1237,21 @@ def main():
 
     p = sub.add_parser("paths", help="显示数据源路径")
 
+    p = sub.add_parser("open-list", help="列出已打开会话清单（state/open.json）")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("snapshot", help="把当前运行中的会话记为清单（不关闭任何东西）")
+
+    p = sub.add_parser("restore", help="重开清单里的会话（误关窗口 / 重启后一条命令恢复）")
+    p.add_argument("--all", action="store_true", help="连正在运行的也再开一份（默认跳过）")
+    p.add_argument("--window", choices=["tab", "new"], default="tab")
+    p.add_argument("--dry-run", action="store_true", help="只打印命令，不执行")
+
+    p = sub.add_parser("open-rm", help="从清单移除一个会话")
+    p.add_argument("id")
+
+    p = sub.add_parser("open-clear", help="清空清单")
+
     args = ap.parse_args()
     records = scan_all(getattr(args, "agent", None))
 
@@ -1085,6 +1261,7 @@ def main():
         print("Codex 归档:       ", CODEX_ARCHIVE_DIR)
         print("早期输入历史:     ", HOME / ".claude" / "history.jsonl")
         print("备注存储:         ", NOTES_FILE)
+        print("已打开会话清单:   ", OPEN_FILE)
         print(f"当前共索引 {len(records)} 个对话")
         return
 
@@ -1194,6 +1371,48 @@ def main():
                     print(f"    📝 {r['note']}")
         return
 
+    if args.cmd == "open-list":
+        entries = load_open()
+        alive = alive_session_ids()
+        if args.json:
+            print_json([{**e, "alive": e["id"] in alive} for e in entries])
+        elif not entries:
+            print(f"清单为空（{OPEN_FILE}）")
+        else:
+            print(f"已打开会话清单（{OPEN_FILE}）共 {len(entries)} 条，最近在前\n")
+            for e in entries:
+                mark = "运行中" if e["id"] in alive else "已关闭"
+                print(f"  [{mark}] {e['id'][:8]}  {e.get('window', 'tab'):<4} "
+                      f"{e.get('openedAt', '')}  {e.get('cwd', '')}")
+                if e.get("title"):
+                    print(f"              {e['title']}")
+        return
+
+    if args.cmd == "snapshot":
+        snapshot_open()
+        return
+
+    if args.cmd == "restore":
+        restore_sessions(only_missing=not args.all, window=args.window,
+                         dry_run=args.dry_run)
+        return
+
+    if args.cmd == "open-clear":
+        save_open([])
+        print(f"已清空清单（{OPEN_FILE}）")
+        return
+
+    if args.cmd == "open-rm":
+        entries = load_open()
+        key = args.id.lower()
+        keep = [e for e in entries if not e["id"].lower().startswith(key)]
+        if len(keep) == len(entries):
+            print(f"清单里没有匹配 {args.id} 的会话", file=sys.stderr)
+            sys.exit(1)
+        save_open(keep)
+        print(f"已从清单移除 {len(entries) - len(keep)} 条（{args.id}）")
+        return
+
     # 需要 id 的命令
     rec = find_record(records, args.id)
     if not rec:
@@ -1221,7 +1440,8 @@ def main():
         save_notes(notes)
         print(f"{'已收藏' if entry['starred'] else '已取消收藏'} {rec['id'][:8]}")
     elif args.cmd == "resume-cmd":
-        print(resume_command(rec))
+        print(resume_command(rec, args.window))
+        record_open([rec], window=args.window)
 
 
 if __name__ == "__main__":

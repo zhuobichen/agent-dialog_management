@@ -24,6 +24,7 @@ user-invocable: true
 | Codex 归档 | `~/.codex/archived_sessions/` | 已归档会话，list 中标记 `[归档]` |
 | 早期输入历史 | `~/.claude/history.jsonl` | **2025-11 至今**的全部输入记录（早期完整对话已清理，仅剩此处痕迹） |
 | 备注/收藏 | `~/.claude/skills/agent-dialog_management/state/notes.json` | skill 自身维护 |
+| 已打开清单 | `~/.claude/skills/agent-dialog_management/state/open.json` | 记录"哪些会话开着"，供 `restore` 整批重开 |
 
 每个会话记录：ID、来源（C=Claude / X=Codex）、真实工作目录、时间、标题（自动取
 AI 标题或第一条用户消息）、归档状态。
@@ -44,7 +45,11 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 列出全部对话 | `python <脚本> list [--agent claude\|codex] [--limit 20]` |
 | 搜索找回 | `python <脚本> search <关键词>` |
 | 查看内容 | 先 `search`/`list` 拿到短 ID → `python <脚本> show <短ID> [--full]` |
-| 恢复对话 | `python <脚本> resume-cmd <短ID>` → 执行输出的命令 |
+| 恢复对话 | `python <脚本> resume-cmd <短ID> [--window tab\|new]` → 执行输出的命令 |
+| 记住此刻开着的 | `python <脚本> snapshot`（不改动任何会话，只把运行中的记入清单） |
+| 看已打开清单 | `python <脚本> open-list`（标出「运行中 / 已关闭」） |
+| **一键整批重开** | `python <脚本> restore [--all] [--window tab\|new] [--dry-run]` |
+| 从清单移除 / 清空 | `python <脚本> open-rm <短ID>` / `python <脚本> open-clear` |
 | 导出 | `python <脚本> export <短ID> --out <路径.md>` |
 | 备注 | `python <脚本> note <短ID> <文本>` |
 | 收藏/取消 | `python <脚本> star <短ID>` |
@@ -52,7 +57,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 查看正在运行的对话 | `python <脚本> running [--minutes 30]` |
 | 搜索早期输入历史 | `python <脚本> hist <关键词> [--limit 30]` |
 | 启动监控面板 | `python <脚本> serve [--port 8765] [--no-browser]` |
-| 关闭所有 Claude 会话 | `python <脚本> shutdown [--yes]`（更新 claude 后重启用，输出恢复清单） |
+| 关闭所有 Claude 会话 | `python <脚本> shutdown [--yes]`（关闭前自动把运行中的记入清单，之后 `restore` 一条命令全开） |
 | 查看数据源 | `python <脚本> paths` |
 
 **ID 支持前缀匹配**：`show 79b26d95` 或完整 UUID 均可。
@@ -109,6 +114,34 @@ python <脚本> hist 惠州             # 找回惠州项目相关输入（含 2
 每条结果带：时间 / 项目 / sessionId / 输入内容。若 sessionId 恰好对应 6 月后的完整对话，
 可再用 `show`/`resume` 深入。
 
+### 3.6 「我刚才开着哪些？」—— 清单 + 整批重开（open.json / restore）
+**踩过的坑（2026-10-09 关机、2026-10-10 误关各一次）**：所有会话都用
+`wt -w 0 new-tab` 开在**同一扇** Windows Terminal 窗口里，**关一次窗口 = 全部会话一起没**；
+而"当时开着哪些"原本没有记录，只能靠 jsonl mtime / Windows 事件日志反推——很不可靠
+（10-09 那次就漏掉了一个 `677a3f03`）。
+
+现在 skill 自带一份清单 `state/open.json`（最近在前，最多 30 条），**在
+`resume-cmd` / `restore` / `snapshot` / `shutdown` 时自动写入**（每次开/关都会更新）：
+
+```bash
+python <脚本> open-list        # 清单 + 每个会话「运行中/已关闭」
+python <脚本> restore          # 重开清单里"已关闭"的那些（跳过还活着的，避免重复标签）
+python <脚本> restore --all    # 连运行中的也再开一份
+python <脚本> restore --dry-run            # 只看会开什么，不执行
+python <脚本> restore --window new         # 每个会话开独立 WT 窗口（互不连坐）
+python <脚本> snapshot         # 把"此刻真正开着的"记进清单（不关任何东西）
+python <脚本> open-rm <短ID>   # 从清单移除；open-clear 清空
+```
+
+用户说「我刚才的会话被关了/关机了，帮我重启」时的**正确姿势**：直接
+```bash
+python <脚本> restore          # 一条命令，不用再取证
+```
+若清单是空的（功能上线前就开着的会话），先 `snapshot` 再 `restore`。
+
+> **窗口隔离**：`--window new` 用 `wt -w new` 给每个会话开**独立窗口**，关一扇不会
+> 带走其它会话；默认仍是 `-w 0`（同一窗口多标签，手感熟悉但有连坐风险）。
+
 ### 4. 备注 / 收藏
 给重要对话加备注便于日后找回：
 ```bash
@@ -124,7 +157,8 @@ python <脚本> export 79b26d95 --out "E:/CodeProject/notes/对话.md"
 
 ## 边界与约定
 
-- **只读用户数据**：扫描/读取 JSONL 从不修改；唯一写入的是本 skill 自己的 `state/notes.json`。
+- **只读用户数据**：扫描/读取 JSONL 从不修改；唯一写入的是本 skill 自己的
+  `state/notes.json`（备注/收藏）与 `state/open.json`（已打开会话清单）。
 - **Codex 会话管理**（归档/删除）用官方命令：`codex archive <id>` / `codex delete <id>`，
   skill 不做绕过。
 - **标题兜底**：无 AI 标题时取第一条用户消息，无消息则显示 `(无标题)`。
