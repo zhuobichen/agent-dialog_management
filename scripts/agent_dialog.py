@@ -148,24 +148,46 @@ def load_open():
     return out
 
 
-def save_open(sessions):
+def save_open(sessions, taken_at=None):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     OPEN_FILE.write_text(
-        json.dumps({"sessions": sessions[:MAX_OPEN]}, ensure_ascii=False, indent=2),
+        json.dumps({"takenAt": taken_at or now_iso(),
+                    "sessions": sessions[:MAX_OPEN]},
+                   ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
+def open_taken_at():
+    """清单最后一次写入时间（快照时间）"""
+    if not OPEN_FILE.exists():
+        return ""
+    try:
+        d = json.loads(OPEN_FILE.read_text(encoding="utf-8"))
+        return d.get("takenAt", "") if isinstance(d, dict) else ""
+    except Exception:
+        return ""
+
+
 def record_open(recs, window="tab"):
-    """把刚打开的会话记入清单：按 id 去重、最近在前、超出 MAX_OPEN 截断"""
-    entries = [{
-        "id": r["id"],
-        "agent": r.get("agent", "claude"),
-        "cwd": r.get("cwd", ""),
-        "title": (r.get("title") or "")[:80],
-        "openedAt": now_iso(),
-        "window": window,
-    } for r in recs]
+    """把会话记入清单：按 id 去重、最近在前、超出 MAX_OPEN 截断。
+
+    每条同时留两个时间：`openedAt` = **首次**打开时间（重复记录不覆盖），
+    `snapshotAt` = 本次记录时间；文件头 `takenAt` = 本清单最后写入时间。
+    """
+    old = {s["id"]: s for s in load_open()}
+    entries = []
+    for r in recs:
+        prev = old.get(r["id"], {})
+        entries.append({
+            "id": r["id"],
+            "agent": r.get("agent", "claude"),
+            "cwd": r.get("cwd", ""),
+            "title": (r.get("title") or prev.get("title") or "")[:80],
+            "openedAt": prev.get("openedAt") or now_iso(),   # 保留首次打开时间
+            "snapshotAt": now_iso(),
+            "window": window,
+        })
     new_ids = {e["id"] for e in entries}
     kept = [s for s in load_open() if s["id"] not in new_ids]
     save_open(entries + kept)
@@ -863,11 +885,15 @@ def snapshot_open():
     titles = {r["id"]: r.get("title", "") for r in scan_all("claude")}
     recs = [{"id": s["sessionId"], "agent": "claude", "cwd": s["cwd"],
              "title": titles.get(s["sessionId"], "")} for s in sessions]
-    record_open(recs)
-    print(f"已把 {len(recs)} 个运行中的会话记入清单: {OPEN_FILE}")
-    for r in recs:
-        print(f"  {r['id'][:8]}  {r['cwd']}")
-    print(f"\n之后误关窗口/重启，可用 restore 一条命令重开。")
+    entries = record_open(recs)
+    print(f"快照时间: {open_taken_at()}    共 {len(entries)} 个会话")
+    print(f"清单文件: {OPEN_FILE}\n")
+    for e in entries:
+        print(f"  {e['id'][:8]}  {e['cwd']}")
+        if e["title"]:
+            print(f"            {e['title']}")
+    print("\n本机重启 / 误关窗口后，一条命令全部开回来:")
+    print(f'  python "{Path(__file__).resolve()}" restore')
 
 
 def shutdown_claude(force=False):
@@ -1379,11 +1405,12 @@ def main():
         elif not entries:
             print(f"清单为空（{OPEN_FILE}）")
         else:
-            print(f"已打开会话清单（{OPEN_FILE}）共 {len(entries)} 条，最近在前\n")
+            print(f"已打开会话清单（{OPEN_FILE}）")
+            print(f"快照时间: {open_taken_at() or '（未知）'}    共 {len(entries)} 条，最近在前\n")
             for e in entries:
                 mark = "运行中" if e["id"] in alive else "已关闭"
                 print(f"  [{mark}] {e['id'][:8]}  {e.get('window', 'tab'):<4} "
-                      f"{e.get('openedAt', '')}  {e.get('cwd', '')}")
+                      f"打开于 {e.get('openedAt', '')}  {e.get('cwd', '')}")
                 if e.get("title"):
                     print(f"              {e['title']}")
         return
