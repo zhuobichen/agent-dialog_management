@@ -52,6 +52,15 @@ HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude" / "projects"
 CODEX_DIR = HOME / ".codex" / "sessions"
 CODEX_ARCHIVE_DIR = HOME / ".codex" / "archived_sessions"
+
+# 豆包桌面版「Agent 模式」本地工作区（Electron 客户端）
+#   <LOCALAPPDATA>/Doubao/User Data/Default/.doubao/agent_mode/workspace/.sessions/
+#     <sessionId>/agents/<agentId>/system/assignment.md     ← 各 turn 的用户需求（带 ISO 时间戳）
+#     <sessionId>/agents/<agentId>/system/trajectory.jsonl  ← 对话主体（标准 OpenAI messages）
+# ⚠️ 云端是唯一真相源；本地这份是「可重放的本地缓存」（断点续跑 / 渲染界面 / 下一轮上文）。
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA") or str(HOME / "AppData" / "Local")
+DOUBAO_DIR = (Path(_LOCALAPPDATA) / "Doubao" / "User Data" / "Default"
+              / ".doubao" / "agent_mode" / "workspace" / ".sessions")
 SKILL_DIR = Path(__file__).resolve().parent.parent
 STATE_DIR = SKILL_DIR / "state"
 NOTES_FILE = STATE_DIR / "notes.json"
@@ -302,6 +311,70 @@ def scan_codex():
     return records
 
 
+def _fmt_iso_any(ts):
+    """豆包时间戳是 9 位纳秒小数（如 ...T07:41:28.321814445Z），
+    Python 的 %f 只吃 6 位 → 先截到微秒再交给 _fmt_ts。"""
+    if not ts:
+        return ""
+    return _fmt_ts(re.sub(r"\.(\d{6})\d+", r".\1", ts))
+
+
+def _read_assignment(system_dir):
+    """解析 assignment.md 的「## [ISO] 需求」段落。
+
+    返回 (首个需求正文, 末个活动时间戳)。首个需求可作标题，末个时间戳可作最近活动时间。
+    """
+    md = Path(system_dir) / "assignment.md"
+    first, last_ts = "", ""
+    if not md.is_file():
+        return first, last_ts
+    try:
+        txt = md.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return first, last_ts
+    marks = [(m.group(1), m.start(), m.end())
+             for m in re.finditer(r"^##\s*\[([^\]]+)\]\s*需求\s*$", txt, re.M)]
+    for i, (ts, _s, e) in enumerate(marks):
+        end = marks[i + 1][1] if i + 1 < len(marks) else len(txt)
+        body = txt[e:end].strip()
+        if i == 0:
+            first = body
+        last_ts = ts
+    return first, last_ts
+
+
+def scan_doubao():
+    """扫描豆包 Agent 模式的本地会话（每个 <sessionId>/agents/<agentId>/ 一条记录）。"""
+    records = []
+    if not DOUBAO_DIR.is_dir():
+        return records
+    try:
+        sessions = sorted(DOUBAO_DIR.iterdir())
+    except Exception:
+        return records
+    for sess in sessions:
+        agents_dir = sess / "agents"
+        if not agents_dir.is_dir():
+            continue
+        for ag in sorted(agents_dir.iterdir()):
+            traj = ag / "system" / "trajectory.jsonl"
+            if not traj.is_file():
+                continue
+            first, last_ts = _read_assignment(ag / "system")
+            title = (first or "").split("\n")[0].strip()
+            records.append({
+                "id": sess.name,
+                "agent": "doubao",
+                "cwd": "",
+                "project": "豆包 · Agent 模式",
+                "title": title or "(无标题)",
+                "time": _fmt_iso_any(last_ts) or iso_from_mtime(traj),
+                "archived": False,
+                "_file": str(traj),
+            })
+    return records
+
+
 def scan_history():
     """扫描 Claude Code 输入历史（~/.claude/history.jsonl，2025-11 至今）。
 
@@ -397,6 +470,8 @@ def scan_all(agent=None):
         records += scan_claude()
     if agent in (None, "codex"):
         records += scan_codex()
+    if agent in (None, "doubao"):
+        records += scan_doubao()
     # 注入备注/收藏状态
     notes = load_notes()
     for r in records:
@@ -430,6 +505,8 @@ def load_messages(rec):
         return []
     if rec["agent"] == "claude":
         msgs = _load_claude_messages(fp)
+    elif rec["agent"] == "doubao":
+        msgs = _load_doubao_messages(fp)
     else:
         msgs = _load_codex_messages(fp)
     msgs.sort(key=lambda x: (x[0], x[3]))
@@ -479,6 +556,31 @@ def _load_codex_messages(fp):
     return msgs
 
 
+def _load_doubao_messages(fp):
+    """豆包 trajectory.jsonl：标准 OpenAI messages 格式，每行一条
+       {"role":"user","content":"..."}
+       {"role":"assistant","content":"...","tool_calls":[{id,type,function:{name,arguments}}]}
+       {"role":"tool","content":"...","tool_call_id":"..."}
+    纯对话视图只取 user/assistant 且有正文的行（tool 输出、纯 tool_calls 行跳过）。
+    单条无时间戳（豆包不落时间），用 "" 占位。
+    """
+    msgs = []
+    with open(fp, encoding="utf-8", errors="replace") as fh:
+        for i, line in enumerate(fh):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            role = d.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = text_from_blocks(d.get("content"))
+            if not text:
+                continue
+            msgs.append(("", role, text, i))
+    return msgs
+
+
 # ---------------------------------------------------------------------------
 # 搜索
 # ---------------------------------------------------------------------------
@@ -510,7 +612,7 @@ def search_all(records, pattern):
 # ---------------------------------------------------------------------------
 
 def fmt_line(rec):
-    src = "C" if rec["agent"] == "claude" else "X"
+    src = {"claude": "C", "doubao": "D"}.get(rec["agent"], "X")
     flag = " [归档]" if rec.get("archived") else ""
     star = " ⭐" if rec.get("starred") else ""
     title = _truncate(rec["title"].replace("\n", " "), MAX_TITLE)
@@ -673,6 +775,9 @@ def resume_argv(rec, window="tab"):
     """
     sid = rec["id"]
     cwd = rec.get("cwd") or "."
+    if rec["agent"] == "doubao":
+        # 豆包是 GUI 客户端（云端才是真相源），本地没有可 resume 的 CLI 会话
+        raise RuntimeError("豆包是 GUI 客户端，无法命令行恢复；请直接打开豆包桌面版查看")
     if rec["agent"] == "claude":
         inner = f"claude --dangerously-skip-permissions --resume {sid}"
     else:
@@ -693,6 +798,8 @@ def resume_command(rec, window="tab"):
     - 命令用 `-EncodedCommand`（base64 UTF-16LE）：**分号在 wt -Command 参数里
       会被拆开**导致 claude 不启动，编码后安全
     """
+    if rec["agent"] == "doubao":
+        return "（豆包是 GUI 客户端，无法命令行恢复；请直接打开豆包桌面版）"
     wt, wflag, _, _, cwd, _, _, _, b64 = resume_argv(rec, window)
     return f'"{wt}" {wflag} new-tab -d "{cwd}" powershell -NoExit -EncodedCommand {b64}'
 
@@ -764,6 +871,10 @@ def _run_send_task(rec, message):
     """后台线程：向会话非交互发送指令（claude --resume -p / codex exec resume）"""
     sid = rec["id"]
     cwd = rec.get("cwd") or "."
+    if rec["agent"] == "doubao":
+        with SEND_LOCK:
+            SEND_TASKS[sid] = {"status": "error", "finished_at": now_iso()}
+        return
     if rec["agent"] == "claude":
         cmd = ["cmd", "/c", "claude", "--resume", sid, "-p", message]
     else:
@@ -781,6 +892,8 @@ def _run_send_task(rec, message):
 
 def send_to_session(rec, message):
     """启动后台线程发送指令；同会话已有任务在处理则拒绝"""
+    if rec["agent"] == "doubao":
+        return False, "豆包是 GUI 客户端，不支持从命令行发送指令"
     sid = rec["id"]
     with SEND_LOCK:
         t = SEND_TASKS.get(sid)
@@ -961,6 +1074,10 @@ def tail_messages(rec, n=6):
                     text = text_from_blocks(p.get("content"))
                     if text:
                         result.append((d.get("timestamp", ""), p["role"], text))
+            elif d.get("role") in ("user", "assistant"):   # 豆包（无 type 字段）
+                text = text_from_blocks(d.get("content"))
+                if text:
+                    result.append(("", d["role"], text))
             if len(result) >= n:
                 break
         result.reverse()

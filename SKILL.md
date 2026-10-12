@@ -1,17 +1,17 @@
 ---
 name: agent-dialog_management
 description: >
-  管理电脑上所有智能体（Claude Code + Codex）的对话记录：统一列出、全文搜索找回
-  遗忘/关闭的对话、查看内容、导出 Markdown、备注收藏、一键恢复（新开终端窗口
-  继续之前的会话）、查看正在运行的对话。当用户说"我的对话""找到之前那个对话"
-  "恢复某次对话""正在运行的对话""看看智能体聊了什么""导出这次对话"等涉及
-  历史/进行中对话的查找/管理/恢复场景时使用。
+  管理电脑上所有智能体（Claude Code + Codex + 豆包桌面版 Agent 模式）的对话记录：
+  统一列出、全文搜索找回遗忘/关闭的对话、查看内容、导出 Markdown、备注收藏、
+  一键恢复（新开终端窗口继续之前的会话）、查看正在运行的对话。当用户说"我的对话"
+  "找到之前那个对话""恢复某次对话""正在运行的对话""看看智能体聊了什么"
+  "豆包聊了什么""导出这次对话"等涉及历史/进行中对话的查找/管理/恢复场景时使用。
 user-invocable: true
 ---
 
 # 智能体对话管理（agent-dialog_management）
 
-统一管理本机 **Claude Code** 与 **Codex** 的所有对话。核心价值：对话散落在多个目录，
+统一管理本机 **Claude Code**、**Codex** 与 **豆包桌面版 Agent 模式** 的所有对话。核心价值：对话散落在多个目录，
 用户记不清哪个会话做了什么，本 skill 帮用户**找到 → 查看 → 恢复**，并支持
 备注/收藏/导出。
 
@@ -22,12 +22,24 @@ user-invocable: true
 | Claude Code | `~/.claude/projects/<项目>/*.jsonl` | 会话 ID = 文件名 |
 | Codex | `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl` | 含 Desktop/CLI 会话 |
 | Codex 归档 | `~/.codex/archived_sessions/` | 已归档会话，list 中标记 `[归档]` |
+| **豆包** | `%LOCALAPPDATA%/Doubao/User Data/Default/.doubao/agent_mode/workspace/.sessions/<雪花号>/agents/<agentId>/system/` | 桌面版 Agent 模式；对话在 `trajectory.jsonl`，需求/时间在 `assignment.md` |
 | 早期输入历史 | `~/.claude/history.jsonl` | **2025-11 至今**的全部输入记录（早期完整对话已清理，仅剩此处痕迹） |
 | 备注/收藏 | `~/.claude/skills/agent-dialog_management/state/notes.json` | skill 自身维护 |
 | 已打开清单 | `~/.claude/skills/agent-dialog_management/state/open.json` | 记录"哪些会话开着"，供 `restore` 整批重开 |
 
-每个会话记录：ID、来源（C=Claude / X=Codex）、真实工作目录、时间、标题（自动取
+每个会话记录：ID、来源（C=Claude / X=Codex / **D=豆包**）、真实工作目录、时间、标题（自动取
 AI 标题或第一条用户消息）、归档状态。
+
+### 豆包数据源要点（2026-10 实测）
+
+- **云端是唯一真相源**，本地这份是**可重放的本地缓存**（客户端把每轮往返 append 进
+  `trajectory.jsonl` 时内容早已上行；用途=断点续跑/渲染界面/下一轮上文）。
+- `trajectory.jsonl` = **标准 OpenAI messages**：`{"role":"user|assistant|tool","content":…,
+  "tool_calls":[{id,type,function:{name,arguments}}],"tool_call_id":…,"image_link_list":…}`。
+- `assignment.md` = 每轮需求 append-only（`## [ISO] 需求`），**标题取首个需求**，
+  **时间取末个时间戳**（比文件 mtime 准）。⚠️ 时间戳是 **9 位纳秒**，Python `%f` 只吃 6 位，需先截断。
+- ⚠️ **豆包不支持命令行恢复/发指令**（GUI 客户端，无 CLI）：`resume-cmd` 会返回提示，
+  请直接打开豆包桌面版。`restore` 会把它计入"找不到/失败"而无害跳过。
 
 ## 核心命令
 
@@ -42,7 +54,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 
 | 用户意图 | 执行命令 |
 |---|---|
-| 列出全部对话 | `python <脚本> list [--agent claude\|codex] [--limit 20]` |
+| 列出全部对话 | `python <脚本> list [--agent claude\|codex\|doubao] [--limit 20]` |
 | 搜索找回 | `python <脚本> search <关键词>` |
 | 查看内容 | 先 `search`/`list` 拿到短 ID → `python <脚本> show <短ID> [--full]` |
 | 恢复对话 | `python <脚本> resume-cmd <短ID> [--window tab\|new]` → 执行输出的命令 |
@@ -87,6 +99,8 @@ python <脚本> resume-cmd <短ID>
 编码内容 = `Remove-Item Env:CLAUDE_CODE_CHILD_SESSION; claude --dangerously-skip-permissions --resume <id>`
 **执行这条输出**，会在**当前 Windows Terminal 窗口**新开标签页恢复该会话（不弹独立窗口）。
 codex 会话用 `codex resume <id>`。
+**豆包会话不支持恢复**（GUI 客户端、云端才是真相源）：`resume-cmd` 会返回提示文本，
+请直接打开豆包桌面版查看 —— 但豆包会话仍可被 list / search / show / export。
 
 > 经验（2026-08-10）：
 > - 用 `wt -w 0 new-tab -d <目录>` 开当前窗口新标签；**不要**用 `Start-Process powershell`（弹独立系统窗口）
@@ -99,9 +113,10 @@ codex 会话用 `codex resume <id>`。
 ```bash
 python <脚本> serve          # 启动浏览器面板 http://localhost:8765
 ```
-一个页面同时展示所有活跃会话（Claude + Codex）：标题/项目/最近对话（3 秒自动刷新）、
-进程统计。**可向任一会话直接发指令**（卡片底部输入框）——内部用 `claude --resume <id> -p`
-或 `codex exec resume <id>` 非交互恢复执行，回复自动写回会话，面板刷新可见。
+一个页面同时展示所有活跃会话（Claude + Codex + 豆包）：标题/项目/最近对话（3 秒自动刷新）、
+进程统计。**可向 Claude / Codex 会话直接发指令**（卡片底部输入框）——内部用 `claude --resume <id> -p`
+或 `codex exec resume <id>` 非交互恢复执行，回复自动写回会话，面板刷新可见；
+豆包会话为**只读展示**（GUI 客户端，不支持命令行发指令）。
 指令处理较慢（取决于模型），面板会显示"AI 处理中…"。端口占用时用 `--port` 换。
 
 ### 3.5 搜索早期输入历史（history）
