@@ -32,8 +32,14 @@ AI 标题或第一条用户消息）、归档状态。
 
 ### 豆包数据源要点（2026-10 实测）
 
-- **云端是唯一真相源**，本地这份是**可重放的本地缓存**（客户端把每轮往返 append 进
-  `trajectory.jsonl` 时内容早已上行；用途=断点续跑/渲染界面/下一轮上文）。
+- **两级区分**：**云端 = 对话记录（权威历史）**；**本地 = 执行上下文（Agent 工作现场）** ——
+  sandbox manifest、工具调用及其输出。本地这份**不是备份，而是发请求前的原材料**
+  （模型无状态，不给工作现场就接不上话）。时序：`+64.6s sandbox/manifest` →
+  `+66.2s /chat/completion`（读本地在前）；文件写入晚于 upload 上行（先传后记）。
+- 本地用途：重建 Agent 工作现场（最核心）/ 断线续跑 / 免等待渲染 / 下一轮上文。
+  **删掉本地 → 该机 Agent 短暂失忆，对话记录无损**。
+- ⚠️ `trajectory.jsonl` 是唯一能看到 tool_calls 细节的地方，但属"用完可弃"的上下文——
+  **豆包可能清理它，重要会话建议 `export` 存档**。
 - `trajectory.jsonl` = **标准 OpenAI messages**：`{"role":"user|assistant|tool","content":…,
   "tool_calls":[{id,type,function:{name,arguments}}],"tool_call_id":…,"image_link_list":…}`。
 - `assignment.md` = 每轮需求 append-only（`## [ISO] 需求`），**标题取首个需求**，

@@ -57,7 +57,10 @@ CODEX_ARCHIVE_DIR = HOME / ".codex" / "archived_sessions"
 #   <LOCALAPPDATA>/Doubao/User Data/Default/.doubao/agent_mode/workspace/.sessions/
 #     <sessionId>/agents/<agentId>/system/assignment.md     ← 各 turn 的用户需求（带 ISO 时间戳）
 #     <sessionId>/agents/<agentId>/system/trajectory.jsonl  ← 对话主体（标准 OpenAI messages）
-# ⚠️ 云端是唯一真相源；本地这份是「可重放的本地缓存」（断点续跑 / 渲染界面 / 下一轮上文）。
+# ⚠️ 数据归属：云端 = 对话记录（权威历史）；本地 = 执行上下文（Agent 工作现场）。
+#    本地不是"备份"而是"发请求前的原材料"（模型无状态，不给工作现场就接不上话）：
+#    时序上 read manifest 在 /chat/completion 之前，文件写入晚于 upload 上行（先传后记）。
+#    删掉本地 → 该机 Agent 短暂失忆，对话记录无损。
 _LOCALAPPDATA = os.environ.get("LOCALAPPDATA") or str(HOME / "AppData" / "Local")
 DOUBAO_DIR = (Path(_LOCALAPPDATA) / "Doubao" / "User Data" / "Default"
               / ".doubao" / "agent_mode" / "workspace" / ".sessions")
