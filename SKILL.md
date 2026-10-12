@@ -186,5 +186,6 @@ python <脚本> export 79b26d95 --out "E:/CodeProject/notes/对话.md"
 - **running 判定**：活跃 = 最近 N 分钟有写入且未归档。Codex 后台 app-server 会 touch
   旧会话文件造成误报，因此当 Codex 无交互进程时，其"活跃"记录会标注为后台服务活动。
 - **性能**：99 个对话全文搜索约 1~3 秒；list 秒回。
-- 本 skill 用本地 git 管理（`~/.claude/skills/agent-dialog_management/` 内 `git init`），
-  只 commit 不 push。
+- 本 skill 用本地 git 管理（`~/.claude/skills/agent-dialog_management/` 内 `git init`）。
+  **push 按 remote 归属**：`origin` = 用户自己的 GitHub（`zhuobichen`）→ 可直接 push；
+  **Gitea / 内网 / 别人的仓库 → 先确认再推**。
