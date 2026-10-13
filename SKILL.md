@@ -76,6 +76,7 @@ DIALOG="$HOME/.claude/skills/agent-dialog_management/scripts/agent_dialog.py"
 | 搜索早期输入历史 | `python <脚本> hist <关键词> [--limit 30]` |
 | 启动监控面板 | `python <脚本> serve [--port 8765] [--no-browser]` |
 | 关闭所有 Claude 会话 | `python <脚本> shutdown [--yes]`（关闭前自动把运行中的记入清单，之后 `restore` 一条命令全开） |
+| **Codex 索引对账** | `python <脚本> codex-index [--all] [--json]`（哪些 Codex 会话在盘上、却不在 Codex 界面里） |
 | 查看数据源 | `python <脚本> paths` |
 
 **ID 支持前缀匹配**：`show 79b26d95` 或完整 UUID 均可。
@@ -163,6 +164,36 @@ python <脚本> restore          # 一条命令，不用再取证
 > **窗口隔离**：`--window new` 用 `wt -w new` 给每个会话开**独立窗口**，关一扇不会
 > 带走其它会话；默认仍是 `-w 0`（同一窗口多标签，手感熟悉但有连坐风险）。
 
+### 3.7 「我的 Codex 会话不见了」—— 索引对账（codex-index）
+**踩过的坑（2026-10-13）**：用户在 Codex 界面里找不到一个在用的会话（"数据融合远程"，
+`E:\CodeProject\server_manager`，插值前/后对比绘图）。文件其实**完好**——问题是
+Codex 桌面版 Recents 读的是 `~/.codex/sqlite/codex-dev.db` 的 `local_thread_catalog` 表，
+**那张表长期只收录一部分会话**：实测盘上 78 个线程、索引仅 27 个，**51 个在界面里"消失"**。
+
+```bash
+python <脚本> codex-index          # 对账：索引收录 N / 盘上 M / 缺失 K + 缺失清单
+python <脚本> codex-index --all    # 列全（默认只列 30 条）
+python <脚本> codex-index --json
+```
+
+**关键结论（2026-10-13 实测）**：索引缺失**不影响打开** ——
+`codex resume <id>` 对不在索引里的会话照样成功（实测 `01a1206f`，进程正常驻留）。
+所以：
+
+- **不要**去写 `codex-dev.db` 补索引（那是 Codex 自家的库，会被它重建/覆盖，
+  而且没必要——本 skill 是**直接读 rollout 文件**的，`list`/`search`/`show`/`export`/`resume-cmd`
+  从来就不依赖那个索引）；
+- 用户说"某 Codex 会话不见了"时的**正确姿势**：
+  `search <关键词>` 或 `list --agent codex` 找到它 → `resume-cmd <短ID>` 直接开。
+  找不到才需要 `codex-index` 对账（确认是索引问题还是文件真没了）。
+
+> 读索引是**只读**连接（`file:...?mode=ro`），db 不存在或被 Codex 独占时会明确报错、
+> 不影响其它命令。
+>
+> 顺带：Codex 会话 id 是时间序的，**同一秒创建的不同会话会共享前 8 位短 ID**
+> （如 `01a11a65-002e…` / `01a11a65-7c76…` / `01a11a65-d1a2…` 是三个不同会话）。
+> 短 ID 前缀匹配时要留意这点。
+
 ### 4. 备注 / 收藏
 给重要对话加备注便于日后找回：
 ```bash
@@ -180,6 +211,7 @@ python <脚本> export 79b26d95 --out "E:/CodeProject/notes/对话.md"
 
 - **只读用户数据**：扫描/读取 JSONL 从不修改；唯一写入的是本 skill 自己的
   `state/notes.json`（备注/收藏）与 `state/open.json`（已打开会话清单）。
+  `codex-index` 只以 `mode=ro` **读** `codex-dev.db`，**绝不写** Codex 自家的索引库。
 - **Codex 会话管理**（归档/删除）用官方命令：`codex archive <id>` / `codex delete <id>`，
   skill 不做绕过。
 - **标题兜底**：无 AI 标题时取第一条用户消息，无消息则显示 `(无标题)`。

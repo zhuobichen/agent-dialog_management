@@ -32,6 +32,7 @@ import glob
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -52,6 +53,8 @@ HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude" / "projects"
 CODEX_DIR = HOME / ".codex" / "sessions"
 CODEX_ARCHIVE_DIR = HOME / ".codex" / "archived_sessions"
+# Codex 桌面版 Recents 的数据源（**只读**，本 skill 从不改它）
+CODEX_DB = HOME / ".codex" / "sqlite" / "codex-dev.db"
 
 # 豆包桌面版「Agent 模式」本地工作区（Electron 客户端）
 #   <LOCALAPPDATA>/Doubao/User Data/Default/.doubao/agent_mode/workspace/.sessions/
@@ -312,6 +315,92 @@ def scan_codex():
             }
         )
     return records
+
+
+def _codex_thread_id(fp):
+    """rollout-<时间戳>-<threadId>[_<续跑id>].jsonl → threadId
+
+    续跑会在原文件名后追加 `_<新id>`，所以取**第一个** UUID（= 线程 id），
+    与 codex-dev.db 里 local_thread_catalog.thread_id 对齐。
+    """
+    m = re.match(
+        r"rollout-.*?-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_|\.jsonl)",
+        Path(fp).name,
+    )
+    return m.group(1) if m else ""
+
+
+def indexed_codex_threads():
+    """codex-dev.db 的 local_thread_catalog 收录了哪些 thread_id（只读连接）。
+
+    返回 (集合 或 None, 错误信息)。**本 skill 从不写这个库。**
+    """
+    if not CODEX_DB.exists():
+        return None, f"找不到索引库 {CODEX_DB}"
+    try:
+        con = sqlite3.connect(f"file:{CODEX_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            return {r[0] for r in con.execute("select thread_id from local_thread_catalog")}, ""
+        finally:
+            con.close()
+    except Exception as e:            # 被 Codex 独占 / schema 变动
+        return None, str(e)
+
+
+def codex_index_status():
+    """盘上的 Codex 会话 vs Codex 本地索引 —— 对账。
+
+    为什么需要：Codex 桌面版 Recents 读的是 codex-dev.db 的 local_thread_catalog，
+    而那张表**长期只收录一部分会话**（2026-10-13 实测：盘上 78 个线程、索引仅 27 个，
+    51 个在 Codex 界面里"消失"）。rollout 文件其实完好无损，而本 skill 是**直接读文件**的
+    —— 所以这些会话在 list / search / show / export / resume-cmd 里一直都在。
+    """
+    disk = {}
+    for r in scan_codex():
+        tid = _codex_thread_id(r.get("_file", "")) or r["id"]
+        old = disk.get(tid)
+        if old is None or (r.get("time") or "") > (old.get("time") or ""):
+            disk[tid] = r
+    indexed, err = indexed_codex_threads()
+    if indexed is None:
+        return {"db": str(CODEX_DB), "ok": False, "err": err,
+                "disk": len(disk), "catalog_rows": 0, "indexed": 0, "missing": []}
+    missing = [r for tid, r in disk.items() if tid not in indexed]
+    missing.sort(key=lambda r: r.get("time") or "", reverse=True)
+    return {"db": str(CODEX_DB), "ok": True, "err": "",
+            "disk": len(disk), "catalog_rows": len(indexed),
+            "indexed": len(disk) - len(missing), "missing": missing}
+
+
+def cmd_codex_index(limit=30, as_json=False):
+    st = codex_index_status()
+    if as_json:
+        print_json(dict(st, missing=[
+            {"id": r["id"], "time": r["time"], "cwd": r["cwd"],
+             "title": r["title"][:80], "archived": bool(r.get("archived"))}
+            for r in st["missing"]]))
+        return
+    print("Codex 本地索引对账（Codex 桌面版 Recents 的数据源）")
+    print(f"  索引库: {st['db']}")
+    if not st["ok"]:
+        print(f"  ⚠ 读不到索引库: {st['err']}")
+        print("  （读不到也不影响本 skill —— list/search/show 直接读 rollout 文件）")
+        return
+    print(f"  索引收录 {st['catalog_rows']} 个线程 | 盘上 {st['disk']} 个 | "
+          f"其中 {len(st['missing'])} 个不在索引里")
+    if not st["missing"]:
+        print("\n账实相符：盘上每个 Codex 会话在 Codex 界面里都能找到。")
+        return
+    print(f"\n这 {len(st['missing'])} 个在 Codex 界面里看不到，但 rollout 文件完好，"
+          f"本 skill 照样能开：")
+    rows = st["missing"][:limit] if limit else st["missing"]
+    for r in rows:
+        tag = "[归档] " if r.get("archived") else ""
+        print(f"  ★ {r['time']}  {r['id'][:8]}  {tag}{r['cwd']}")
+        print(f"      {r['title'][:76]}")
+    if limit and len(st["missing"]) > limit:
+        print(f"  … 还有 {len(st['missing']) - limit} 个（加 --all 看全）")
+    print(f'\n打开其一: python "{Path(__file__).resolve()}" resume-cmd <短ID>')
 
 
 def _fmt_iso_any(ts):
@@ -1398,6 +1487,12 @@ def main():
 
     p = sub.add_parser("open-clear", help="清空清单")
 
+    p = sub.add_parser("codex-index",
+                       help="对账：盘上的 Codex 会话 vs Codex 界面索引（Recents 数据源）")
+    p.add_argument("--limit", type=int, default=30, help="列出条数（默认30）")
+    p.add_argument("--all", action="store_true", help="列出全部，不限条数")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args()
     records = scan_all(getattr(args, "agent", None))
 
@@ -1408,7 +1503,12 @@ def main():
         print("早期输入历史:     ", HOME / ".claude" / "history.jsonl")
         print("备注存储:         ", NOTES_FILE)
         print("已打开会话清单:   ", OPEN_FILE)
+        print("Codex 界面索引库: ", CODEX_DB, "（只读，对账用 codex-index）")
         print(f"当前共索引 {len(records)} 个对话")
+        return
+
+    if args.cmd == "codex-index":
+        cmd_codex_index(limit=0 if args.all else args.limit, as_json=args.json)
         return
 
     if args.cmd == "serve":
