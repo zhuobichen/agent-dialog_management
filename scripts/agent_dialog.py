@@ -909,22 +909,26 @@ def restore_sessions(only_missing=True, window="tab", dry_run=False):
     records = scan_all(None)
     by_id = {r["id"]: r for r in records}
     alive = alive_session_ids()
-    todo, skipped, missing = [], [], []
+    todo, skipped, missing, nogui = [], [], [], []
     for e in entries:
         sid = e["id"]
         if only_missing and sid in alive:
             skipped.append(e)
         elif sid not in by_id:
             missing.append(e)          # 会话文件已不存在（被删/清理）
+        elif by_id[sid].get("agent") == "doubao":
+            nogui.append(by_id[sid])   # 豆包是 GUI 客户端，无法命令行恢复
         else:
             todo.append(by_id[sid])
 
     print(f"清单 {len(entries)} 条 → 待重开 {len(todo)}，已在运行 {len(skipped)}，"
-          f"找不到会话文件 {len(missing)}")
+          f"找不到会话文件 {len(missing)}" + (f"，GUI 跳过 {len(nogui)}" if nogui else ""))
     for e in skipped:
         print(f"  · 已在运行，跳过  {e['id'][:8]}  {e.get('cwd','')}")
     for e in missing:
         print(f"  ! 会话文件已不存在  {e['id'][:8]}  {e.get('cwd','')}")
+    for r in nogui:
+        print(f"  · GUI 客户端，跳过  {r['id'][:8]}  {r['title'][:30]}（请手动打开豆包桌面版）")
     if not todo:
         print("\n没有需要重开的会话。")
         return
